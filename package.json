@@ -65,7 +65,10 @@
     "yargs": "^17.6.2"
   },
   "scripts": {
-    "postinstall": "cross-env PUPPETEER_PRODUCT=firefox node node_modules/puppeteer/install.js"
+    "postinstall": "cross-env PUPPETEER_PRODUCT=firefox node node_modules/puppeteer/install.js",
+    "dev": "gulp server",
+    "build": "gulp generic",
+    "build-all": "gulp generic-legacy"
   },
   "repository": {
     "type": "git",
