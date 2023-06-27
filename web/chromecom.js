@@ -27,6 +27,23 @@ if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("CHROME")) {
   );
 }
 
+(function rewriteUrlClosure() {
+  // Run this code outside DOMContentLoaded to make sure that the URL
+  // is rewritten as soon as possible.
+  const queryString = document.location.search.slice(1);
+  const m = /(^|&)file=([^&]*)/.exec(queryString);
+  const defaultUrl = m ? decodeURIComponent(m[2]) : "";
+
+  // Example: chrome-extension://.../http://example.com/file.pdf
+  const humanReadableUrl = "/" + defaultUrl + location.hash;
+  history.replaceState(history.state, "", humanReadableUrl);
+  if (top === window) {
+    chrome.runtime.sendMessage("showPageAction");
+  }
+
+  AppOptions.set("defaultUrl", defaultUrl);
+})();
+
 const ChromeCom = {
   /**
    * Creates an event that the extension is listening for and will
@@ -133,7 +150,7 @@ function isRuntimeAvailable() {
     if (chrome.runtime?.getManifest()) {
       return true;
     }
-  } catch (e) {}
+  } catch {}
   return false;
 }
 
@@ -356,7 +373,7 @@ class ChromePreferences extends BasePreferences {
         );
 
         chrome.storage.managed.get(defaultManagedPrefs, function (items) {
-          items = items || defaultManagedPrefs;
+          items ||= defaultManagedPrefs;
           // Migration logic for deprecated preferences: If the new preference
           // is not defined by an administrator (i.e. the value is the same as
           // the default value), and a deprecated preference is set with a

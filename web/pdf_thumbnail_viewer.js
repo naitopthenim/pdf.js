@@ -61,6 +61,7 @@ class PDFThumbnailViewer {
     pageColors,
   }) {
     this.container = container;
+    this.eventBus = eventBus;
     this.linkService = linkService;
     this.renderingQueue = renderingQueue;
     this.l10n = l10n;
@@ -218,6 +219,7 @@ class PDFThumbnailViewer {
         for (let pageNum = 1; pageNum <= pagesCount; ++pageNum) {
           const thumbnail = new PDFThumbnailView({
             container: this.container,
+            eventBus: this.eventBus,
             id: pageNum,
             defaultViewport: viewport.clone(),
             optionalContentConfigPromise,

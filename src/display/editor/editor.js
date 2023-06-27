@@ -67,6 +67,7 @@ class AnnotationEditor {
     this.name = parameters.name;
     this.div = null;
     this._uiManager = parameters.uiManager;
+    this.annotationElementId = null;
 
     const {
       rotation,
@@ -74,6 +75,8 @@ class AnnotationEditor {
     } = this.parent.viewport;
 
     this.rotation = rotation;
+    this.pageRotation =
+      (360 + rotation - this._uiManager.viewParameters.rotation) % 360;
     this.pageDimensions = [pageWidth, pageHeight];
     this.pageTranslation = [pageX, pageY];
 
@@ -82,6 +85,7 @@ class AnnotationEditor {
     this.y = parameters.y / height;
 
     this.isAttachedToDOM = false;
+    this.deleted = false;
   }
 
   static get _defaultLineColor() {
@@ -90,6 +94,17 @@ class AnnotationEditor {
       "_defaultLineColor",
       this._colorManager.getHexCode("CanvasText")
     );
+  }
+
+  static deleteAnnotationElement(editor) {
+    const fakeEditor = new FakeEditor({
+      id: editor.parent.getNextId(),
+      parent: editor.parent,
+      uiManager: editor._uiManager,
+    });
+    fakeEditor.annotationElementId = editor.annotationElementId;
+    fakeEditor.deleted = true;
+    fakeEditor._uiManager.addToAnnotationStorage(fakeEditor);
   }
 
   /**
@@ -250,7 +265,7 @@ class AnnotationEditor {
   }
 
   get parentRotation() {
-    return this._uiManager.viewParameters.rotation;
+    return (this._uiManager.viewParameters.rotation + this.pageRotation) % 360;
   }
 
   get parentDimensions() {
@@ -469,6 +484,7 @@ class AnnotationEditor {
    */
   rebuild() {
     this.div?.addEventListener("focusin", this.#boundFocusin);
+    this.div?.addEventListener("focusout", this.#boundFocusout);
   }
 
   /**
@@ -477,8 +493,9 @@ class AnnotationEditor {
    * new annotation to add to the pdf document.
    *
    * To implement in subclasses.
+   * @param {boolean} isForCopying
    */
-  serialize() {
+  serialize(_isForCopying = false) {
     unreachable("An editor must be serializable");
   }
 
@@ -596,6 +613,23 @@ class AnnotationEditor {
     } else {
       this.parent.setActiveEditor(null);
     }
+  }
+}
+
+// This class is used to fake an editor which has been deleted.
+class FakeEditor extends AnnotationEditor {
+  constructor(params) {
+    super(params);
+    this.annotationElementId = params.annotationElementId;
+    this.deleted = true;
+  }
+
+  serialize() {
+    return {
+      id: this.annotationElementId,
+      deleted: true,
+      pageIndex: this.pageIndex,
+    };
   }
 }
 

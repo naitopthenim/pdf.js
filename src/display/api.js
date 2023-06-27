@@ -21,13 +21,14 @@ import {
   AbortException,
   AnnotationMode,
   assert,
-  createPromiseCapability,
   getVerbosityLevel,
   info,
   InvalidPDFException,
   isArrayBuffer,
+  MAX_IMAGE_SIZE_TO_CACHE,
   MissingPDFException,
   PasswordException,
+  PromiseCapability,
   RenderingIntentFlag,
   setVerbosityLevel,
   shadow,
@@ -45,6 +46,7 @@ import {
   deprecated,
   DOMCanvasFactory,
   DOMCMapReaderFactory,
+  DOMFilterFactory,
   DOMStandardFontDataFactory,
   isDataScheme,
   isValidFetchUrl,
@@ -65,25 +67,27 @@ import { XfaText } from "./xfa_text.js";
 
 const DEFAULT_RANGE_CHUNK_SIZE = 65536; // 2^16 = 65536
 const RENDERING_CANCELLED_TIMEOUT = 100; // ms
+const DELAYED_CLEANUP_TIMEOUT = 5000; // ms
 
-let DefaultCanvasFactory = DOMCanvasFactory;
-let DefaultCMapReaderFactory = DOMCMapReaderFactory;
-let DefaultStandardFontDataFactory = DOMStandardFontDataFactory;
-
-if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS) {
-  const {
-    NodeCanvasFactory,
-    NodeCMapReaderFactory,
-    NodeStandardFontDataFactory,
-  } = require("./node_utils.js");
-
-  DefaultCanvasFactory = NodeCanvasFactory;
-  DefaultCMapReaderFactory = NodeCMapReaderFactory;
-  DefaultStandardFontDataFactory = NodeStandardFontDataFactory;
-}
+const DefaultCanvasFactory =
+  typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS
+    ? require("./node_utils.js").NodeCanvasFactory
+    : DOMCanvasFactory;
+const DefaultCMapReaderFactory =
+  typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS
+    ? require("./node_utils.js").NodeCMapReaderFactory
+    : DOMCMapReaderFactory;
+const DefaultFilterFactory =
+  typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS
+    ? require("./node_utils.js").NodeFilterFactory
+    : DOMFilterFactory;
+const DefaultStandardFontDataFactory =
+  typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS
+    ? require("./node_utils.js").NodeStandardFontDataFactory
+    : DOMStandardFontDataFactory;
 
 let createPDFNetworkStream;
-if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("PRODUCTION")) {
+if (typeof PDFJSDev === "undefined") {
   const streamsPromise = Promise.all([
     import("./network.js"),
     import("./fetch_stream.js"),
@@ -200,6 +204,9 @@ if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("PRODUCTION")) {
  *   `OffscreenCanvas` in the worker. Primarily used to improve performance of
  *   image conversion/rendering.
  *   The default value is `true` in web environments and `false` in Node.js.
+ * @property {number} [canvasMaxAreaInBytes] - The integer value is used to
+ *   know when an image must be resized (uses `OffscreenCanvas` in the worker).
+ *   If it's -1 then a possibly slow algorithm is used to guess the max value.
  * @property {boolean} [disableFontFace] - By default fonts are converted to
  *   OpenType fonts and loaded via the Font Loading API or `@font-face` rules.
  *   If disabled, fonts will be rendered using a built-in font renderer that
@@ -230,6 +237,10 @@ if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("PRODUCTION")) {
  *   disabling of pre-fetching to work correctly.
  * @property {boolean} [pdfBug] - Enables special hooks for debugging PDF.js
  *   (see `web/debugger.js`). The default value is `false`.
+ * @property {Object} [canvasFactory] - The factory instance that will be used
+ *   when creating canvases. The default value is {new DOMCanvasFactory()}.
+ * @property {Object} [filterFactory] - A factory instance that will be used
+ *   to create SVG filters when rendering some images on the main canvas.
  */
 
 /**
@@ -250,21 +261,9 @@ function getDocument(src) {
       src = { url: src };
     } else if (isArrayBuffer(src)) {
       src = { data: src };
-    } else if (src instanceof PDFDataRangeTransport) {
-      deprecated(
-        "`PDFDataRangeTransport`-instance, " +
-          "please use a parameter object with `range`-property instead."
-      );
-      src = { range: src };
-    } else {
-      if (typeof src !== "object") {
-        throw new Error(
-          "Invalid parameter in getDocument, " +
-            "need either string, URL, TypedArray, or parameter object."
-        );
-      }
     }
-  } else if (typeof src !== "object") {
+  }
+  if (typeof src !== "object") {
     throw new Error("Invalid parameter in getDocument, need parameter object.");
   }
   if (!src.url && !src.data && !src.range) {
@@ -273,6 +272,7 @@ function getDocument(src) {
     );
   }
   const task = new PDFDocumentLoadingTask();
+  const { docId } = task;
 
   const url = src.url ? getUrlProp(src.url) : null;
   const data = src.data ? getDataProp(src.data) : null;
@@ -313,6 +313,9 @@ function getDocument(src) {
     typeof src.isOffscreenCanvasSupported === "boolean"
       ? src.isOffscreenCanvasSupported
       : !isNodeJS;
+  const canvasMaxAreaInBytes = Number.isInteger(src.canvasMaxAreaInBytes)
+    ? src.canvasMaxAreaInBytes
+    : -1;
   const disableFontFace =
     typeof src.disableFontFace === "boolean" ? src.disableFontFace : isNodeJS;
   const fontExtraProperties = src.fontExtraProperties === true;
@@ -337,6 +340,10 @@ function getDocument(src) {
           StandardFontDataFactory === DOMStandardFontDataFactory &&
           isValidFetchUrl(cMapUrl, document.baseURI) &&
           isValidFetchUrl(standardFontDataUrl, document.baseURI));
+  const canvasFactory =
+    src.canvasFactory || new DefaultCanvasFactory({ ownerDocument });
+  const filterFactory =
+    src.filterFactory || new DefaultFilterFactory({ docId, ownerDocument });
 
   // Parameters only intended for development/testing purposes.
   const styleElement =
@@ -349,17 +356,19 @@ function getDocument(src) {
 
   // Ensure that the various factories can be initialized, when necessary,
   // since the user may provide *custom* ones.
-  const transportFactory = useWorkerFetch
-    ? null
-    : {
-        cMapReaderFactory: new CMapReaderFactory({
-          baseUrl: cMapUrl,
-          isCompressed: cMapPacked,
-        }),
-        standardFontDataFactory: new StandardFontDataFactory({
-          baseUrl: standardFontDataUrl,
-        }),
-      };
+  const transportFactory = {
+    canvasFactory,
+    filterFactory,
+  };
+  if (!useWorkerFetch) {
+    transportFactory.cMapReaderFactory = new CMapReaderFactory({
+      baseUrl: cMapUrl,
+      isCompressed: cMapPacked,
+    });
+    transportFactory.standardFontDataFactory = new StandardFontDataFactory({
+      baseUrl: standardFontDataUrl,
+    });
+  }
 
   if (!worker) {
     const workerParams = {
@@ -373,7 +382,6 @@ function getDocument(src) {
       : new PDFWorker(workerParams);
     task._worker = worker;
   }
-  const docId = task.docId;
 
   const fetchDocParams = {
     docId,
@@ -394,6 +402,7 @@ function getDocument(src) {
       ignoreErrors,
       isEvalSupported,
       isOffscreenCanvasSupported,
+      canvasMaxAreaInBytes,
       fontExtraProperties,
       useSystemFonts,
       cMapUrl: useWorkerFetch ? cMapUrl : null,
@@ -507,13 +516,14 @@ async function _fetchDocument(worker, source) {
 function getUrlProp(val) {
   if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
     return null; // The 'url' is unused with `PDFDataRangeTransport`.
-  } else if (val instanceof URL) {
+  }
+  if (val instanceof URL) {
     return val.href;
   }
   try {
     // The full path is required in the 'url' field.
     return new URL(val, window.location).href;
-  } catch (ex) {
+  } catch {
     if (
       typeof PDFJSDev !== "undefined" &&
       PDFJSDev.test("GENERIC") &&
@@ -538,21 +548,21 @@ function getDataProp(val) {
     typeof Buffer !== "undefined" && // eslint-disable-line no-undef
     val instanceof Buffer // eslint-disable-line no-undef
   ) {
+    deprecated(
+      "Please provide binary data as `Uint8Array`, rather than `Buffer`."
+    );
     return new Uint8Array(val);
-  } else if (
-    val instanceof Uint8Array &&
-    val.byteLength === val.buffer.byteLength
-  ) {
+  }
+  if (val instanceof Uint8Array && val.byteLength === val.buffer.byteLength) {
     // Use the data as-is when it's already a Uint8Array that completely
     // "utilizes" its underlying ArrayBuffer, to prevent any possible
     // issues when transferring it to the worker-thread.
     return val;
-  } else if (typeof val === "string") {
+  }
+  if (typeof val === "string") {
     return stringToBytes(val);
-  } else if (
-    (typeof val === "object" && !isNaN(val?.length)) ||
-    isArrayBuffer(val)
-  ) {
+  }
+  if ((typeof val === "object" && !isNaN(val?.length)) || isArrayBuffer(val)) {
     return new Uint8Array(val);
   }
   throw new Error(
@@ -575,10 +585,8 @@ function getDataProp(val) {
 class PDFDocumentLoadingTask {
   static #docId = 0;
 
-  #onUnsupportedFeature = null;
-
   constructor() {
-    this._capability = createPromiseCapability();
+    this._capability = new PromiseCapability();
     this._transport = null;
     this._worker = null;
 
@@ -609,28 +617,6 @@ class PDFDocumentLoadingTask {
      * @type {function}
      */
     this.onProgress = null;
-  }
-
-  /**
-   * @type {function | null} The current callback used with unsupported
-   * features.
-   */
-  get onUnsupportedFeature() {
-    return this.#onUnsupportedFeature;
-  }
-
-  /**
-   * Callback for when an unsupported feature is used in the PDF document.
-   * The callback receives an {@link UNSUPPORTED_FEATURES} argument.
-   * @type {function}
-   */
-  set onUnsupportedFeature(callback) {
-    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
-      deprecated(
-        "The PDFDocumentLoadingTask onUnsupportedFeature property will be removed in the future."
-      );
-      this.#onUnsupportedFeature = callback;
-    }
   }
 
   /**
@@ -687,7 +673,7 @@ class PDFDataRangeTransport {
     this._progressListeners = [];
     this._progressiveReadListeners = [];
     this._progressiveDoneListeners = [];
-    this._readyCapability = createPromiseCapability();
+    this._readyCapability = new PromiseCapability();
   }
 
   /**
@@ -781,6 +767,25 @@ class PDFDocumentProxy {
   constructor(pdfInfo, transport) {
     this._pdfInfo = pdfInfo;
     this._transport = transport;
+
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+      // For testing purposes.
+      Object.defineProperty(this, "getXFADatasets", {
+        value: () => {
+          return this._transport.getXFADatasets();
+        },
+      });
+      Object.defineProperty(this, "getXRefPrevValue", {
+        value: () => {
+          return this._transport.getXRefPrevValue();
+        },
+      });
+      Object.defineProperty(this, "getAnnotArray", {
+        value: pageIndex => {
+          return this._transport.getAnnotArray(pageIndex);
+        },
+      });
+    }
   }
 
   /**
@@ -788,6 +793,13 @@ class PDFDocumentProxy {
    */
   get annotationStorage() {
     return this._transport.annotationStorage;
+  }
+
+  /**
+   * @type {Object} The filter factory instance.
+   */
+  get filterFactory() {
+    return this._transport.filterFactory;
   }
 
   /**
@@ -1111,10 +1123,10 @@ class PDFDocumentProxy {
  * Page getTextContent parameters.
  *
  * @typedef {Object} getTextContentParameters
- * @property {boolean} disableCombineTextItems - Do not attempt to combine
- *   same line {@link TextItem}'s. The default value is `false`.
  * @property {boolean} [includeMarkedContent] - When true include marked
  *   content items in the items array of TextContent. The default is `false`.
+ * @property {boolean} [disableNormalization] - When true the text is *not*
+ *   normalized in the worker-thread. The default is `false`.
  */
 
 /**
@@ -1175,7 +1187,8 @@ class PDFDocumentProxy {
  * Page render parameters.
  *
  * @typedef {Object} RenderParameters
- * @property {Object} canvasContext - A 2D context of a DOM Canvas object.
+ * @property {CanvasRenderingContext2D} canvasContext - A 2D context of a DOM
+ *   Canvas object.
  * @property {PageViewport} viewport - Rendering viewport obtained by calling
  *   the `PDFPageProxy.getViewport` method.
  * @property {string} [intent] - Rendering intent, can be 'display', 'print',
@@ -1194,9 +1207,8 @@ class PDFDocumentProxy {
  *   The default value is `AnnotationMode.ENABLE`.
  * @property {Array<any>} [transform] - Additional transform, applied just
  *   before viewport transform.
- * @property {Object} [canvasFactory] - The factory instance that will be used
- *   when creating canvases. The default value is {new DOMCanvasFactory()}.
- * @property {Object | string} [background] - Background to use for the canvas.
+ * @property {CanvasGradient | CanvasPattern | string} [background] - Background
+ *   to use for the canvas.
  *   Any valid `canvas.fillStyle` can be used: a `DOMString` parsed as CSS
  *   <color> value, a `CanvasGradient` object (a linear or radial gradient) or
  *   a `CanvasPattern` object (a repetitive image). The default value is
@@ -1270,10 +1282,13 @@ class PDFDocumentProxy {
  * Proxy to a `PDFPage` in the worker thread.
  */
 class PDFPageProxy {
-  constructor(pageIndex, pageInfo, transport, ownerDocument, pdfBug = false) {
+  #delayedCleanupTimeout = null;
+
+  #pendingCleanup = false;
+
+  constructor(pageIndex, pageInfo, transport, pdfBug = false) {
     this._pageIndex = pageIndex;
     this._pageInfo = pageInfo;
-    this._ownerDocument = ownerDocument;
     this._transport = transport;
     this._stats = pdfBug ? new StatTimer() : null;
     this._pdfBug = pdfBug;
@@ -1281,10 +1296,7 @@ class PDFPageProxy {
     this.commonObjs = transport.commonObjs;
     this.objs = new PDFObjects();
 
-    this._bitmaps = new Set();
-
-    this.cleanupAfterRender = false;
-    this.pendingCleanup = false;
+    this._maybeCleanupAfterRender = false;
     this._intentStates = new Map();
     this.destroyed = false;
   }
@@ -1399,13 +1411,22 @@ class PDFPageProxy {
     intent = "display",
     annotationMode = AnnotationMode.ENABLE,
     transform = null,
-    canvasFactory = null,
     background = null,
     optionalContentConfigPromise = null,
     annotationCanvasMap = null,
     pageColors = null,
     printAnnotationStorage = null,
   }) {
+    if (
+      (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) &&
+      arguments[0]?.canvasFactory
+    ) {
+      throw new Error(
+        "render no longer accepts the `canvasFactory`-option, " +
+          "please pass it to the `getDocument`-function instead."
+      );
+    }
+
     this._stats?.time("Overall");
 
     const intentArgs = this._transport.getRenderingIntent(
@@ -1414,8 +1435,10 @@ class PDFPageProxy {
       printAnnotationStorage
     );
     // If there was a pending destroy, cancel it so no cleanup happens during
-    // this call to render.
-    this.pendingCleanup = false;
+    // this call to render...
+    this.#pendingCleanup = false;
+    // ... and ensure that a delayed cleanup is always aborted.
+    this.#abortDelayedCleanup();
 
     if (!optionalContentConfigPromise) {
       optionalContentConfigPromise = this._transport.getOptionalContentConfig();
@@ -1433,9 +1456,6 @@ class PDFPageProxy {
       intentState.streamReaderCancelTimeout = null;
     }
 
-    const canvasFactoryInstance =
-      canvasFactory ||
-      new DefaultCanvasFactory({ ownerDocument: this._ownerDocument });
     const intentPrint = !!(
       intentArgs.renderingIntent & RenderingIntentFlag.PRINT
     );
@@ -1443,7 +1463,7 @@ class PDFPageProxy {
     // If there's no displayReadyCapability yet, then the operatorList
     // was never requested before. Make the request and create the promise.
     if (!intentState.displayReadyCapability) {
-      intentState.displayReadyCapability = createPromiseCapability();
+      intentState.displayReadyCapability = new PromiseCapability();
       intentState.operatorList = {
         fnArray: [],
         argsArray: [],
@@ -1459,11 +1479,11 @@ class PDFPageProxy {
       intentState.renderTasks.delete(internalRenderTask);
 
       // Attempt to reduce memory usage during *printing*, by always running
-      // cleanup once rendering has finished (regardless of cleanupAfterRender).
-      if (this.cleanupAfterRender || intentPrint) {
-        this.pendingCleanup = true;
+      // cleanup immediately once rendering has finished.
+      if (this._maybeCleanupAfterRender || intentPrint) {
+        this.#pendingCleanup = true;
       }
-      this._tryCleanup();
+      this.#tryCleanup(/* delayed = */ !intentPrint);
 
       if (error) {
         internalRenderTask.capability.reject(error);
@@ -1494,7 +1514,8 @@ class PDFPageProxy {
       annotationCanvasMap,
       operatorList: intentState.operatorList,
       pageIndex: this._pageIndex,
-      canvasFactory: canvasFactoryInstance,
+      canvasFactory: this._transport.canvasFactory,
+      filterFactory: this._transport.filterFactory,
       useRequestAnimationFrame: !intentPrint,
       pdfBug: this._pdfBug,
       pageColors,
@@ -1508,7 +1529,7 @@ class PDFPageProxy {
       optionalContentConfigPromise,
     ])
       .then(([transparency, optionalContentConfig]) => {
-        if (this.pendingCleanup) {
+        if (this.destroyed) {
           complete();
           return;
         }
@@ -1536,6 +1557,9 @@ class PDFPageProxy {
     annotationMode = AnnotationMode.ENABLE,
     printAnnotationStorage = null,
   } = {}) {
+    if (typeof PDFJSDev !== "undefined" && !PDFJSDev.test("GENERIC")) {
+      throw new Error("Not implemented: getOperatorList");
+    }
     function operatorListChanged() {
       if (intentState.operatorList.lastChunk) {
         intentState.opListReadCapability.resolve(intentState.operatorList);
@@ -1560,7 +1584,7 @@ class PDFPageProxy {
     if (!intentState.opListReadCapability) {
       opListTask = Object.create(null);
       opListTask.operatorListChanged = operatorListChanged;
-      intentState.opListReadCapability = createPromiseCapability();
+      intentState.opListReadCapability = new PromiseCapability();
       (intentState.renderTasks ||= new Set()).add(opListTask);
       intentState.operatorList = {
         fnArray: [],
@@ -1583,8 +1607,8 @@ class PDFPageProxy {
    * @returns {ReadableStream} Stream for reading text content chunks.
    */
   streamTextContent({
-    disableCombineTextItems = false,
     includeMarkedContent = false,
+    disableNormalization = false,
   } = {}) {
     const TEXT_CONTENT_CHUNK_SIZE = 100;
 
@@ -1592,8 +1616,8 @@ class PDFPageProxy {
       "GetTextContent",
       {
         pageIndex: this._pageIndex,
-        combineTextItems: disableCombineTextItems !== true,
         includeMarkedContent: includeMarkedContent === true,
+        disableNormalization: disableNormalization === true,
       },
       {
         highWaterMark: TEXT_CONTENT_CHUNK_SIZE,
@@ -1678,11 +1702,9 @@ class PDFPageProxy {
       }
     }
     this.objs.clear();
-    for (const bitmap of this._bitmaps) {
-      bitmap.close();
-    }
-    this._bitmaps.clear();
-    this.pendingCleanup = false;
+    this.#pendingCleanup = false;
+    this.#abortDelayedCleanup();
+
     return Promise.all(waitOn);
   }
 
@@ -1694,16 +1716,34 @@ class PDFPageProxy {
    * @returns {boolean} Indicates if clean-up was successfully run.
    */
   cleanup(resetStats = false) {
-    this.pendingCleanup = true;
-    return this._tryCleanup(resetStats);
+    this.#pendingCleanup = true;
+    const success = this.#tryCleanup(/* delayed = */ false);
+
+    if (resetStats && success) {
+      this._stats &&= new StatTimer();
+    }
+    return success;
   }
 
   /**
    * Attempts to clean up if rendering is in a state where that's possible.
-   * @private
+   * @param {boolean} [delayed] - Delay the cleanup, to e.g. improve zooming
+   *   performance in documents with large images.
+   *   The default value is `false`.
+   * @returns {boolean} Indicates if clean-up was successfully run.
    */
-  _tryCleanup(resetStats = false) {
-    if (!this.pendingCleanup) {
+  #tryCleanup(delayed = false) {
+    this.#abortDelayedCleanup();
+
+    if (!this.#pendingCleanup || this.destroyed) {
+      return false;
+    }
+    if (delayed) {
+      this.#delayedCleanupTimeout = setTimeout(() => {
+        this.#delayedCleanupTimeout = null;
+        this.#tryCleanup(/* delayed = */ false);
+      }, DELAYED_CLEANUP_TIMEOUT);
+
       return false;
     }
     for (const { renderTasks, operatorList } of this._intentStates.values()) {
@@ -1711,18 +1751,17 @@ class PDFPageProxy {
         return false;
       }
     }
-
     this._intentStates.clear();
     this.objs.clear();
-    if (resetStats && this._stats) {
-      this._stats = new StatTimer();
-    }
-    for (const bitmap of this._bitmaps) {
-      bitmap.close();
-    }
-    this._bitmaps.clear();
-    this.pendingCleanup = false;
+    this.#pendingCleanup = false;
     return true;
+  }
+
+  #abortDelayedCleanup() {
+    if (this.#delayedCleanupTimeout) {
+      clearTimeout(this.#delayedCleanupTimeout);
+      this.#delayedCleanupTimeout = null;
+    }
   }
 
   /**
@@ -1758,7 +1797,7 @@ class PDFPageProxy {
     }
 
     if (operatorListChunk.lastChunk) {
-      this._tryCleanup();
+      this.#tryCleanup(/* delayed = */ true);
     }
   }
 
@@ -1766,10 +1805,7 @@ class PDFPageProxy {
    * @private
    */
   _pumpOperatorList({ renderingIntent, cacheKey, annotationStorageMap }) {
-    if (
-      typeof PDFJSDev === "undefined" ||
-      PDFJSDev.test("!PRODUCTION || TESTING")
-    ) {
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
       assert(
         Number.isInteger(renderingIntent) && renderingIntent > 0,
         '_pumpOperatorList: Expected valid "renderingIntent" argument.'
@@ -1816,7 +1852,7 @@ class PDFPageProxy {
             for (const internalRenderTask of intentState.renderTasks) {
               internalRenderTask.operatorListChanged();
             }
-            this._tryCleanup();
+            this.#tryCleanup(/* delayed = */ true);
           }
 
           if (intentState.displayReadyCapability) {
@@ -1836,10 +1872,7 @@ class PDFPageProxy {
    * @private
    */
   _abortOperatorList({ intentState, reason, force = false }) {
-    if (
-      typeof PDFJSDev === "undefined" ||
-      PDFJSDev.test("!PRODUCTION || TESTING")
-    ) {
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
       assert(
         reason instanceof Error,
         '_abortOperatorList: Expected valid "reason" argument.'
@@ -1901,7 +1934,8 @@ class PDFPageProxy {
   }
 
   /**
-   * @type {Object} Returns page stats, if enabled; returns `null` otherwise.
+   * @type {StatTimer | null} Returns page stats, if enabled; returns `null`
+   *   otherwise.
    */
   get stats() {
     return this._stats;
@@ -1909,13 +1943,20 @@ class PDFPageProxy {
 }
 
 class LoopbackPort {
-  #listeners = [];
+  #listeners = new Set();
 
   #deferred = Promise.resolve();
 
-  postMessage(obj, transfers) {
+  postMessage(obj, transfer) {
     const event = {
-      data: structuredClone(obj, transfers),
+      data: structuredClone(
+        obj,
+        (typeof PDFJSDev === "undefined" ||
+          PDFJSDev.test("SKIP_BABEL || TESTING")) &&
+          transfer
+          ? { transfer }
+          : null
+      ),
     };
 
     this.#deferred.then(() => {
@@ -1926,23 +1967,22 @@ class LoopbackPort {
   }
 
   addEventListener(name, listener) {
-    this.#listeners.push(listener);
+    this.#listeners.add(listener);
   }
 
   removeEventListener(name, listener) {
-    const i = this.#listeners.indexOf(listener);
-    this.#listeners.splice(i, 1);
+    this.#listeners.delete(listener);
   }
 
   terminate() {
-    this.#listeners.length = 0;
+    this.#listeners.clear();
   }
 }
 
 /**
  * @typedef {Object} PDFWorkerParameters
  * @property {string} [name] - The name of the worker.
- * @property {Object} [port] - The `workerPort` object.
+ * @property {Worker} [port] - The `workerPort` object.
  * @property {number} [verbosity] - Controls the logging level;
  *   the constants from {@link VerbosityLevel} should be used.
  */
@@ -1979,7 +2019,7 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
       if (!base.origin || base.origin === "null") {
         return false; // non-HTTP url
       }
-    } catch (e) {
+    } catch {
       return false;
     }
 
@@ -2020,7 +2060,7 @@ class PDFWorker {
     this.destroyed = false;
     this.verbosity = verbosity;
 
-    this._readyCapability = createPromiseCapability();
+    this._readyCapability = new PromiseCapability();
     this._port = null;
     this._webWorker = null;
     this._messageHandler = null;
@@ -2096,12 +2136,9 @@ class PDFWorker {
           );
         }
 
-        // Some versions of FF can't create a worker on localhost, see:
-        // https://bugzilla.mozilla.org/show_bug.cgi?id=683280
         const worker =
-          (typeof PDFJSDev === "undefined" || !PDFJSDev.test("PRODUCTION")) &&
-          !workerSrc.endsWith("/build/pdf.worker.js") &&
-          !workerSrc.endsWith("/src/worker_loader.js")
+          typeof PDFJSDev === "undefined" &&
+          !workerSrc.endsWith("/build/pdf.worker.js")
             ? new Worker(workerSrc, { type: "module" })
             : new Worker(workerSrc);
         const messageHandler = new MessageHandler("main", "worker", worker);
@@ -2158,7 +2195,7 @@ class PDFWorker {
           }
           try {
             sendTest();
-          } catch (e) {
+          } catch {
             // We need fallback to a faked worker.
             this._setupFakeWorker();
           }
@@ -2175,7 +2212,7 @@ class PDFWorker {
         // The worker shall process only the first received "test" message.
         sendTest();
         return;
-      } catch (e) {
+      } catch {
         info("The worker has been disabled.");
       }
     }
@@ -2276,7 +2313,7 @@ class PDFWorker {
   static get _mainThreadWorkerMessageHandler() {
     try {
       return globalThis.pdfjsWorker?.WorkerMessageHandler || null;
-    } catch (ex) {
+    } catch {
       return null;
     }
   }
@@ -2290,7 +2327,7 @@ class PDFWorker {
         // The worker was already loaded using e.g. a `<script>` tag.
         return mainWorkerMessageHandler;
       }
-      if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("PRODUCTION")) {
+      if (typeof PDFJSDev === "undefined") {
         const worker = await import("pdfjs/pdf.worker.js");
         return worker.WorkerMessageHandler;
       }
@@ -2340,14 +2377,15 @@ class WorkerTransport {
     this.loadingTask = loadingTask;
     this.commonObjs = new PDFObjects();
     this.fontLoader = new FontLoader({
-      onUnsupportedFeature: this._onUnsupportedFeature.bind(this),
       ownerDocument: params.ownerDocument,
       styleElement: params.styleElement,
     });
     this._params = params;
 
-    this.cMapReaderFactory = factory?.cMapReaderFactory;
-    this.standardFontDataFactory = factory?.standardFontDataFactory;
+    this.canvasFactory = factory.canvasFactory;
+    this.filterFactory = factory.filterFactory;
+    this.cMapReaderFactory = factory.cMapReaderFactory;
+    this.standardFontDataFactory = factory.standardFontDataFactory;
 
     this.destroyed = false;
     this.destroyCapability = null;
@@ -2356,9 +2394,30 @@ class WorkerTransport {
     this._networkStream = networkStream;
     this._fullReader = null;
     this._lastProgress = null;
-    this.downloadInfoCapability = createPromiseCapability();
+    this.downloadInfoCapability = new PromiseCapability();
 
     this.setupMessageHandler();
+
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+      // For testing purposes.
+      Object.defineProperty(this, "getXFADatasets", {
+        value: () => {
+          return this.messageHandler.sendWithPromise("GetXFADatasets", null);
+        },
+      });
+      Object.defineProperty(this, "getXRefPrevValue", {
+        value: () => {
+          return this.messageHandler.sendWithPromise("GetXRefPrevValue", null);
+        },
+      });
+      Object.defineProperty(this, "getAnnotArray", {
+        value: pageIndex => {
+          return this.messageHandler.sendWithPromise("GetAnnotArray", {
+            pageIndex,
+          });
+        },
+      });
+    }
   }
 
   #cacheSimpleMethod(name, data = null) {
@@ -2441,7 +2500,7 @@ class WorkerTransport {
     }
 
     this.destroyed = true;
-    this.destroyCapability = createPromiseCapability();
+    this.destroyCapability = new PromiseCapability();
 
     if (this._passwordCapability) {
       this._passwordCapability.reject(
@@ -2469,6 +2528,7 @@ class WorkerTransport {
       this.commonObjs.clear();
       this.fontLoader.clear();
       this.#methodPromises.clear();
+      this.filterFactory.destroy();
 
       if (this._networkStream) {
         this._networkStream.cancelAllRequests(
@@ -2534,7 +2594,7 @@ class WorkerTransport {
     });
 
     messageHandler.on("ReaderHeadersReady", data => {
-      const headersCapability = createPromiseCapability();
+      const headersCapability = new PromiseCapability();
       const fullReader = this._fullReader;
       fullReader.headersReady.then(() => {
         // If stream or range are disabled, it's our only way to report
@@ -2649,7 +2709,7 @@ class WorkerTransport {
     });
 
     messageHandler.on("PasswordRequest", exception => {
-      this._passwordCapability = createPromiseCapability();
+      this._passwordCapability = new PromiseCapability();
 
       if (loadingTask.onPassword) {
         const updatePassword = password => {
@@ -2712,20 +2772,15 @@ class WorkerTransport {
             break;
           }
 
-          let fontRegistry = null;
-          if (params.pdfBug && globalThis.FontInspector?.enabled) {
-            fontRegistry = {
-              registerFont(font, url) {
-                globalThis.FontInspector.fontAdded(font, url);
-              },
-            };
-          }
+          const inspectFont =
+            params.pdfBug && globalThis.FontInspector?.enabled
+              ? (font, url) => globalThis.FontInspector.fontAdded(font, url)
+              : null;
           const font = new FontFaceObject(exportedData, {
             isEvalSupported: params.isEvalSupported,
             disableFontFace: params.disableFontFace,
             ignoreErrors: params.ignoreErrors,
-            onUnsupportedFeature: this._onUnsupportedFeature.bind(this),
-            fontRegistry,
+            inspectFont,
           });
 
           this.fontLoader
@@ -2747,6 +2802,7 @@ class WorkerTransport {
           break;
         case "FontPath":
         case "Image":
+        case "Pattern":
           this.commonObjs.resolve(id, exportedData);
           break;
         default:
@@ -2770,19 +2826,17 @@ class WorkerTransport {
           pageProxy.objs.resolve(id, imageData);
 
           // Heuristic that will allow us not to store large data.
-          const MAX_IMAGE_SIZE_TO_STORE = 8000000;
           if (imageData) {
             let length;
             if (imageData.bitmap) {
-              const { bitmap, width, height } = imageData;
+              const { width, height } = imageData;
               length = width * height * 4;
-              pageProxy._bitmaps.add(bitmap);
             } else {
               length = imageData.data?.length || 0;
             }
 
-            if (length > MAX_IMAGE_SIZE_TO_STORE) {
-              pageProxy.cleanupAfterRender = true;
+            if (length > MAX_IMAGE_SIZE_TO_CACHE) {
+              pageProxy._maybeCleanupAfterRender = true;
             }
           }
           break;
@@ -2803,13 +2857,6 @@ class WorkerTransport {
         total: data.total,
       });
     });
-
-    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
-      messageHandler.on(
-        "UnsupportedFeature",
-        this._onUnsupportedFeature.bind(this)
-      );
-    }
 
     messageHandler.on("FetchBuiltInCMap", data => {
       if (this.destroyed) {
@@ -2838,15 +2885,6 @@ class WorkerTransport {
       }
       return this.standardFontDataFactory.fetch(data);
     });
-  }
-
-  _onUnsupportedFeature({ featureId }) {
-    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
-      if (this.destroyed) {
-        return; // Ignore any pending requests if the worker was terminated.
-      }
-      this.loadingTask.onUnsupportedFeature?.(featureId);
-    }
   }
 
   getData() {
@@ -2898,7 +2936,6 @@ class WorkerTransport {
           pageIndex,
           pageInfo,
           this,
-          this._params.ownerDocument,
           this._params.pdfBug
         );
         this.#pageCache.set(pageIndex, page);
@@ -3061,6 +3098,7 @@ class WorkerTransport {
       this.fontLoader.clear();
     }
     this.#methodPromises.clear();
+    this.filterFactory.destroy(/* keepHCM = */ true);
   }
 
   get loadingParams() {
@@ -3092,7 +3130,7 @@ class PDFObjects {
       return obj;
     }
     return (this.#objs[objId] = {
-      capability: createPromiseCapability(),
+      capability: new PromiseCapability(),
       data: null,
     });
   }
@@ -3150,6 +3188,10 @@ class PDFObjects {
   }
 
   clear() {
+    for (const objId in this.#objs) {
+      const { data } = this.#objs[objId];
+      data?.bitmap?.close(); // Release any `ImageBitmap` data.
+    }
     this.#objs = Object.create(null);
   }
 }
@@ -3224,6 +3266,7 @@ class InternalRenderTask {
     operatorList,
     pageIndex,
     canvasFactory,
+    filterFactory,
     useRequestAnimationFrame = false,
     pdfBug = false,
     pageColors = null,
@@ -3237,6 +3280,7 @@ class InternalRenderTask {
     this.operatorList = operatorList;
     this._pageIndex = pageIndex;
     this.canvasFactory = canvasFactory;
+    this.filterFactory = filterFactory;
     this._pdfBug = pdfBug;
     this.pageColors = pageColors;
 
@@ -3246,7 +3290,7 @@ class InternalRenderTask {
     this._useRequestAnimationFrame =
       useRequestAnimationFrame === true && typeof window !== "undefined";
     this.cancelled = false;
-    this.capability = createPromiseCapability();
+    this.capability = new PromiseCapability();
     this.task = new RenderTask(this);
     // caching this-bound methods
     this._cancelBound = this.cancel.bind(this);
@@ -3290,6 +3334,7 @@ class InternalRenderTask {
       this.commonObjs,
       this.objs,
       this.canvasFactory,
+      this.filterFactory,
       { optionalContentConfig },
       this.annotationCanvasMap,
       this.pageColors
@@ -3317,7 +3362,6 @@ class InternalRenderTask {
       error ||
         new RenderingCancelledException(
           `Rendering cancelled, page ${this._pageIndex + 1}`,
-          "canvas",
           extraDelay
         )
     );
@@ -3325,9 +3369,7 @@ class InternalRenderTask {
 
   operatorListChanged() {
     if (!this.graphicsReady) {
-      if (!this.graphicsReadyCallback) {
-        this.graphicsReadyCallback = this._continueBound;
-      }
+      this.graphicsReadyCallback ||= this._continueBound;
       return;
     }
     this.stepper?.updateOperatorList(this.operatorList);
@@ -3373,7 +3415,7 @@ class InternalRenderTask {
     if (this.operatorListIdx === this.operatorList.argsArray.length) {
       this.running = false;
       if (this.operatorList.lastChunk) {
-        this.gfx.endDrawing();
+        this.gfx.endDrawing(this.pageColors);
         if (this._canvas) {
           InternalRenderTask.#canvasInUse.delete(this._canvas);
         }
@@ -3394,6 +3436,7 @@ export {
   build,
   DefaultCanvasFactory,
   DefaultCMapReaderFactory,
+  DefaultFilterFactory,
   DefaultStandardFontDataFactory,
   getDocument,
   LoopbackPort,

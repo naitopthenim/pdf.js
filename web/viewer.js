@@ -36,26 +36,6 @@ window.PDFViewerApplication = PDFViewerApplication;
 window.PDFViewerApplicationConstants = AppConstants;
 window.PDFViewerApplicationOptions = AppOptions;
 
-if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("CHROME")) {
-  (function rewriteUrlClosure() {
-    // Run this code outside DOMContentLoaded to make sure that the URL
-    // is rewritten as soon as possible.
-    const queryString = document.location.search.slice(1);
-    const m = /(^|&)file=([^&]*)/.exec(queryString);
-    const defaultUrl = m ? decodeURIComponent(m[2]) : "";
-
-    // Example: chrome-extension://.../http://example.com/file.pdf
-    const humanReadableUrl = "/" + defaultUrl + location.hash;
-    history.replaceState(history.state, "", humanReadableUrl);
-    if (top === window) {
-      // eslint-disable-next-line no-undef
-      chrome.runtime.sendMessage("showPageAction");
-    }
-
-    AppOptions.set("defaultUrl", defaultUrl);
-  })();
-}
-
 function getViewerConfiguration() {
   return {
     appContainer: document.body,
@@ -116,6 +96,7 @@ function getViewerConfiguration() {
       outerContainer: document.getElementById("outerContainer"),
       sidebarContainer: document.getElementById("sidebarContainer"),
       toggleButton: document.getElementById("sidebarToggle"),
+      resizer: document.getElementById("sidebarResizer"),
       // Buttons
       thumbnailButton: document.getElementById("viewThumbnail"),
       outlineButton: document.getElementById("viewOutline"),
@@ -131,10 +112,6 @@ function getViewerConfiguration() {
         "outlineOptionsContainer"
       ),
       currentOutlineItemButton: document.getElementById("currentOutlineItem"),
-    },
-    sidebarResizer: {
-      outerContainer: document.getElementById("outerContainer"),
-      resizer: document.getElementById("sidebarResizer"),
     },
     findBar: {
       bar: document.getElementById("findbar"),
@@ -199,9 +176,12 @@ function webViewerLoad() {
     // Give custom implementations of the default viewer a simpler way to
     // set various `AppOptions`, by dispatching an event once all viewer
     // files are loaded but *before* the viewer initialization has run.
-    const event = document.createEvent("CustomEvent");
-    event.initCustomEvent("webviewerloaded", true, true, {
-      source: window,
+    const event = new CustomEvent("webviewerloaded", {
+      bubbles: true,
+      cancelable: true,
+      detail: {
+        source: window,
+      },
     });
     try {
       // Attempt to dispatch the event at the embedding `document`,

@@ -40,11 +40,14 @@ class FirefoxCom {
     const request = document.createTextNode("");
     document.documentElement.append(request);
 
-    const sender = document.createEvent("CustomEvent");
-    sender.initCustomEvent("pdf.js.message", true, false, {
-      action,
-      data,
-      sync: true,
+    const sender = new CustomEvent("pdf.js.message", {
+      bubbles: true,
+      cancelable: false,
+      detail: {
+        action,
+        data,
+        sync: true,
+      },
     });
     request.dispatchEvent(sender);
     const response = sender.detail.response;
@@ -88,12 +91,15 @@ class FirefoxCom {
     }
     document.documentElement.append(request);
 
-    const sender = document.createEvent("CustomEvent");
-    sender.initCustomEvent("pdf.js.message", true, false, {
-      action,
-      data,
-      sync: false,
-      responseExpected: !!callback,
+    const sender = new CustomEvent("pdf.js.message", {
+      bubbles: true,
+      cancelable: false,
+      detail: {
+        action,
+        data,
+        sync: false,
+        responseExpected: !!callback,
+      },
     });
     request.dispatchEvent(sender);
   }
@@ -102,10 +108,11 @@ class FirefoxCom {
 class DownloadManager {
   #openBlobUrls = new WeakMap();
 
-  downloadUrl(url, filename) {
+  downloadUrl(url, filename, options = {}) {
     FirefoxCom.request("download", {
       originalUrl: url,
       filename,
+      options,
     });
   }
 
@@ -154,25 +161,21 @@ class DownloadManager {
     return false;
   }
 
-  download(blob, url, filename) {
+  download(blob, url, filename, options = {}) {
     const blobUrl = URL.createObjectURL(blob);
 
     FirefoxCom.request("download", {
       blobUrl,
       originalUrl: url,
       filename,
+      options,
     });
   }
 }
 
 class FirefoxPreferences extends BasePreferences {
-  async _writeToStorage(prefObj) {
-    return FirefoxCom.requestAsync("setPreferences", prefObj);
-  }
-
   async _readFromStorage(prefObj) {
-    const prefStr = await FirefoxCom.requestAsync("getPreferences", prefObj);
-    return JSON.parse(prefStr);
+    return FirefoxCom.requestAsync("getPreferences", prefObj);
   }
 }
 
@@ -222,7 +225,6 @@ class MozL10n {
       source: window,
       type: type.substring(findLen),
       query: detail.query,
-      phraseSearch: true,
       caseSensitive: !!detail.caseSensitive,
       entireWord: !!detail.entireWord,
       highlightAll: !!detail.highlightAll,
@@ -433,6 +435,19 @@ class FirefoxExternalServices extends DefaultExternalServices {
     // various test-suites are running in mozilla-central.
     const isInAutomation = FirefoxCom.requestSync("isInAutomation");
     return shadow(this, "isInAutomation", isInAutomation);
+  }
+
+  static get canvasMaxAreaInBytes() {
+    const maxArea = FirefoxCom.requestSync("getCanvasMaxArea");
+    return shadow(this, "canvasMaxAreaInBytes", maxArea);
+  }
+
+  static async getNimbusExperimentData() {
+    const nimbusData = await FirefoxCom.requestAsync(
+      "getNimbusExperimentData",
+      null
+    );
+    return nimbusData && JSON.parse(nimbusData);
   }
 }
 PDFViewerApplication.externalServices = FirefoxExternalServices;

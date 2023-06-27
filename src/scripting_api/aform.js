@@ -60,7 +60,7 @@ class AForm {
     if (!actions) {
       actions = [];
       this._dateActionsCache.set(cFormat, actions);
-      cFormat.replace(
+      cFormat.replaceAll(
         /(d+)|(m+)|(y+)|(H+)|(M+)|(s+)/g,
         function (match, d, m, y, H, M, s) {
           if (d) {
@@ -144,7 +144,7 @@ class AForm {
     let date = null;
     try {
       date = this._util.scand(cFormat, cDate);
-    } catch (error) {}
+    } catch {}
     if (!date) {
       date = Date.parse(cDate);
       if (isNaN(date)) {
